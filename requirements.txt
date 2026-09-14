@@ -1,8 +1,17 @@
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
 python-multipart==0.0.9
-deepface==0.0.93
-tf-keras==2.17.0
-numpy==1.26.4
+numpy==2.2.6
+onnxruntime==1.23.2
+opencv-python-headless==5.0.0.93
+insightface==1.0.1
 pydantic==2.9.2
 python-dotenv==1.0.1
+
+# NOTE: deepface/tensorflow/tf-keras were dropped in favor of
+# onnxruntime + insightface (ArcFace, buffalo_l pack). The original
+# TensorFlow-based stack crashes with SIGILL on CPUs without AVX
+# (e.g. this VPS's QEMU virtual CPU exposes no AVX at all). If you
+# deploy on hardware/host with AVX support, the original deepface
+# stack is a fine (and slightly more accurate, with anti-spoofing)
+# alternative — see git history for main.py before this change.

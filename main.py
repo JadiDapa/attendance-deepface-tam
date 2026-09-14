@@ -1,7 +1,22 @@
 """
 Face Recognition Service (stateless)
 -------------------------------------
-Menggunakan DeepFace (model ArcFace) untuk membuat embedding wajah.
+Menggunakan InsightFace (ArcFace, buffalo_l pack) via ONNX Runtime untuk
+membuat embedding wajah.
+
+CATATAN BACKEND: implementasi awal servis ini memakai DeepFace/TensorFlow,
+tapi TensorFlow versi prebuilt (PyPI) mensyaratkan CPU dengan AVX. VPS ini
+punya CPU virtual QEMU tanpa AVX sama sekali, jadi TensorFlow crash
+(SIGILL) begitu di-import. Servis ini dipindah ke onnxruntime + insightface
+karena ONNX Runtime tidak mensyaratkan AVX. Konsekuensinya:
+- Model embedding beda (insightface w600k_r50, bukan deepface ArcFace) -
+  embedding lama (kalau ada) TIDAK kompatibel dan harus di-enroll ulang.
+- Anti-spoofing (liveness) SEMENTARA NONAKTIF - Fasnet/MiniFASNet asli
+  butuh PyTorch, yang juga berisiko kena masalah AVX yang sama, dan belum
+  ada pengganti ONNX yang tervalidasi. Lihat ANTI_SPOOFING_ENABLED di bawah.
+- Kalau nanti deploy ke host dengan AVX, pertimbangkan balik ke
+  deepface/TensorFlow untuk anti-spoofing bawaan + akurasi yang sedikit
+  lebih matang.
 
 Arsitektur "Opsi A" (disepakati dengan tim Next.js):
 - Servis ini TIDAK menyimpan data apa pun (tidak ada db.json, tidak ada
@@ -23,22 +38,24 @@ Cara jalankan:
     uvicorn main:app --reload --port 8000
 
 Catatan:
-- DeepFace akan otomatis download model ArcFace saat pertama kali dipakai
-  (butuh koneksi internet, bisa makan waktu beberapa menit di run pertama).
+- insightface akan otomatis download model pack "buffalo_l" saat pertama
+  kali dipakai (butuh koneksi internet, ~280MB, sekali saja lalu dicache
+  di ~/.insightface/models/).
 """
 
 import json
+import logging
 import os
-import tempfile
 import threading
 from contextlib import asynccontextmanager
 from typing import List, Optional
 
+import cv2
 import numpy as np
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from insightface.app import FaceAnalysis
 from pydantic import BaseModel
-from deepface import DeepFace
 
 # --- Load .env kalau python-dotenv tersedia (opsional, tidak wajib di prod
 # kalau env var sudah di-set lewat sistem/orchestrator) ---
@@ -49,24 +66,24 @@ try:
 except ImportError:
     pass
 
+logger = logging.getLogger("face-api")
+logging.basicConfig(level=logging.INFO)
+
+MODEL_PACK = "buffalo_l"
+DET_SIZE = (640, 640)
+
+# Deteksi + embedding dalam satu model pack (SCRFD untuk deteksi wajah,
+# w600k_r50/ArcFace untuk embedding 512-d).
+face_app: Optional[FaceAnalysis] = None
+
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    """Muat semua model di awal, bukan saat request pertama datang.
-
-    DeepFace memuat model secara lazy, jadi tanpa ini absensi pertama setelah
-    servis dinyalakan menanggung ~18-40 detik pemuatan model (detector, Fasnet,
-    ArcFace) — request berikutnya baru ~1-2 detik. Diukur di mesin dev: dengan
-    warmup ini request pertama turun ke ~2 detik.
-
-    Kalau uvicorn dijalankan dengan --reload, tiap perubahan file me-restart
-    worker dan biaya ini dibayar ulang — jangan pakai --reload saat mengukur
-    waktu absensi atau di produksi.
-    """
-    DeepFace.build_model(model_name=DETECTOR_BACKEND, task="face_detector")
-    DeepFace.build_model(model_name=MODEL_NAME, task="facial_recognition")
-    if ANTI_SPOOFING_ENABLED:
-        DeepFace.build_model(model_name="Fasnet", task="spoofing")
+    """Muat model insightface di awal, bukan saat request pertama datang,
+    supaya request absensi pertama tidak menanggung biaya load model."""
+    global face_app
+    face_app = FaceAnalysis(name=MODEL_PACK, providers=["CPUExecutionProvider"])
+    face_app.prepare(ctx_id=-1, det_size=DET_SIZE)
     yield
 
 
@@ -84,17 +101,24 @@ app.add_middleware(
 
 FACE_API_SECRET = os.environ.get("FACE_API_SECRET")
 MATCH_THRESHOLD = float(os.environ.get("FACE_MATCH_THRESHOLD", "0.68"))
-DETECTOR_BACKEND = os.environ.get("FACE_DETECTOR_BACKEND", "retinaface")
-MODEL_NAME = "ArcFace"
-# Liveness check (tolak foto dari layar/cetak). Bisa dimatikan sementara lewat
-# .env kalau perlu debug, tapi disarankan tetap ON di /verify (absensi).
-ANTI_SPOOFING_ENABLED = os.environ.get("FACE_ANTI_SPOOFING", "true").lower() == "true"
+# NOTE: threshold ini dikalibrasi untuk deepface/ArcFace, belum tentu pas
+# untuk embedding insightface (model beda). Perlu diuji ulang dengan data
+# nyata sebelum dipakai serius.
 
-# DeepFace/TensorFlow memakai satu instance model yang di-cache global, dan
-# predict-nya bukan CPU-bound yang aman dipanggil dari banyak thread sekaligus.
-# Endpoint di bawah sengaja `def` (bukan `async def`) supaya FastAPI menjalankannya
-# di threadpool dan event loop tidak ikut beku; lock ini yang menjaga supaya
-# pekerjaan model tetap satu per satu.
+ANTI_SPOOFING_ENABLED = os.environ.get("FACE_ANTI_SPOOFING", "true").lower() == "true"
+if ANTI_SPOOFING_ENABLED:
+    logger.warning(
+        "FACE_ANTI_SPOOFING=true di .env, tapi backend ONNX/insightface di "
+        "servis ini BELUM punya liveness check. Anti-spoofing dianggap OFF "
+        "untuk sesi ini — jangan andalkan servis ini untuk menolak foto "
+        "hasil layar/cetak sampai ini diimplementasikan."
+    )
+
+# insightface/onnxruntime session belum tentu aman dipanggil dari banyak
+# thread sekaligus untuk satu instance FaceAnalysis; lock ini menjaga
+# supaya pekerjaan model tetap satu per satu. Endpoint di bawah sengaja
+# `def` (bukan `async def`) supaya FastAPI menjalankannya di threadpool
+# dan event loop tidak ikut beku menunggu lock ini.
 _model_lock = threading.Lock()
 
 if not FACE_API_SECRET:
@@ -111,51 +135,28 @@ def verify_secret(x_internal_secret: Optional[str] = Header(default=None)) -> No
 
 
 def get_embedding_from_upload(photo: UploadFile) -> List[float]:
-    """Simpan foto ke file sementara, ekstrak embedding, lalu selalu bersihkan
-    file sementara tsb (servis ini stateless — tidak ada foto yang disimpan
-    permanen)."""
-    suffix = os.path.splitext(photo.filename or "")[1] or ".jpg"
+    """Decode foto langsung dari memori (servis ini stateless — tidak ada
+    foto yang ditulis ke disk atau disimpan permanen), lalu ekstrak
+    embedding wajah paling yakin (det_score tertinggi) kalau ada lebih
+    dari satu wajah terdeteksi."""
+    data = photo.file.read()
+    img_array = np.frombuffer(data, dtype=np.uint8)
+    img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
 
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-        tmp.write(photo.file.read())
-        tmp_path = tmp.name
+    if img is None:
+        raise HTTPException(status_code=400, detail="File bukan gambar yang valid.")
 
-    try:
-        with _model_lock:
-            if ANTI_SPOOFING_ENABLED:
-                # Liveness check dulu (Fasnet) SEBELUM ekstrak embedding — tolak
-                # kalau ini foto dari foto/layar (printed photo / replay attack),
-                # bukan wajah asli di depan kamera.
-                faces = DeepFace.extract_faces(
-                    img_path=tmp_path,
-                    detector_backend=DETECTOR_BACKEND,
-                    anti_spoofing=True,
-                    enforce_detection=True,
-                )
-                if not faces or not faces[0].get("is_real", False):
-                    raise HTTPException(
-                        status_code=400,
-                        detail="Wajah terdeteksi tidak asli (kemungkinan foto dari layar/cetak). Gunakan kamera langsung.",
-                    )
+    with _model_lock:
+        faces = face_app.get(img)
 
-            result = DeepFace.represent(
-                img_path=tmp_path,
-                model_name=MODEL_NAME,
-                detector_backend=DETECTOR_BACKEND,
-                enforce_detection=True,
-            )
-        # DeepFace.represent bisa mengembalikan beberapa wajah; ambil yang
-        # pertama (foto enrollment/absensi diasumsikan 1 wajah per foto).
-        return result[0]["embedding"]
-    except HTTPException:
-        raise
-    except Exception:
+    if not faces:
         raise HTTPException(
             status_code=400,
             detail="Wajah tidak terdeteksi pada foto. Coba foto lain dengan pencahayaan lebih baik.",
         )
-    finally:
-        os.remove(tmp_path)
+
+    best_face = max(faces, key=lambda f: f.det_score)
+    return best_face.embedding.tolist()
 
 
 def cosine_distance(a: List[float], b: List[float]) -> float:
@@ -181,6 +182,11 @@ class VerifyResponse(BaseModel):
     distance: Optional[float] = None
 
 
+@app.get("/health")
+def health():
+    return {"status": "ok", "model": MODEL_PACK, "anti_spoofing": False}
+
+
 @app.post("/embed", response_model=EmbedResponse)
 def embed(
     photo: UploadFile = File(...),
@@ -193,7 +199,7 @@ def embed(
 
     return EmbedResponse(
         status="ok",
-        embedding=EmbeddingPayload(vector=vector, model=MODEL_NAME),
+        embedding=EmbeddingPayload(vector=vector, model=MODEL_PACK),
     )
 
 
