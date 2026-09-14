@@ -43,6 +43,7 @@ Catatan:
   di ~/.insightface/models/).
 """
 
+import hmac
 import json
 import logging
 import os
@@ -129,8 +130,12 @@ if not FACE_API_SECRET:
 
 
 def verify_secret(x_internal_secret: Optional[str] = Header(default=None)) -> None:
-    """Dependency: tolak request kalau header X-Internal-Secret tidak cocok."""
-    if x_internal_secret != FACE_API_SECRET:
+    """Dependency: tolak request kalau header X-Internal-Secret tidak cocok.
+    Pakai compare_digest (bukan `!=`) supaya waktu pembandingannya tidak bocor
+    berapa banyak karakter awal yang sudah cocok."""
+    if not x_internal_secret or not hmac.compare_digest(
+        x_internal_secret, FACE_API_SECRET
+    ):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
